@@ -20,7 +20,13 @@ fq initial_quantum 90140
 
 ## 运行
 
-上传脚本到服务器后执行：
+一键运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/byJoey/oci-singleflow-tune/main/oci-singleflow-tune.sh | sudo bash
+```
+
+如果想先下载再执行：
 
 ```bash
 sudo bash oci-singleflow-tune.sh
