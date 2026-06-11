@@ -77,6 +77,7 @@ backup_file() {
 set_netplan_mtu() {
   local iface="$1"
   local file="$2"
+  local mac=""
 
   if [[ -z "${file}" || ! -f "${file}" ]]; then
     echo "No netplan file found. Applying runtime MTU only; set NETPLAN_FILE to persist netplan MTU." >&2
@@ -85,8 +86,11 @@ set_netplan_mtu() {
   fi
 
   backup_file "${file}"
+  if [[ -r "/sys/class/net/${iface}/address" ]]; then
+    mac="$(tr '[:upper:]' '[:lower:]' < "/sys/class/net/${iface}/address")"
+  fi
 
-  python3 - "$file" "$iface" "$MTU" <<'PY'
+  python3 - "$file" "$iface" "$MTU" "$mac" <<'PY'
 import pathlib
 import re
 import sys
@@ -94,27 +98,101 @@ import sys
 path = pathlib.Path(sys.argv[1])
 iface = sys.argv[2]
 mtu = sys.argv[3]
+runtime_mac = sys.argv[4].lower()
 text = path.read_text()
 lines = text.splitlines()
 
-iface_line = None
-iface_indent = None
+def indent_of(line):
+    return len(line) - len(line.lstrip(" "))
+
+def block_end(start, indent):
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        stripped = lines[i].strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if indent_of(lines[i]) <= indent:
+            end = i
+            break
+    return end
+
+ethernets_line = None
+ethernets_indent = None
 for i, line in enumerate(lines):
-    m = re.match(r"^(\s*)" + re.escape(iface) + r":\s*$", line)
-    if m:
-        iface_line = i
-        iface_indent = len(m.group(1))
+    if re.match(r"^\s*ethernets:\s*$", line):
+        ethernets_line = i
+        ethernets_indent = indent_of(line)
         break
 
-if iface_line is None:
-    raise SystemExit(f"Interface {iface!r} was not found in {path}")
+if ethernets_line is None:
+    raise SystemExit(f"No 'ethernets:' section was found in {path}")
 
-end = len(lines)
+ethernets_end = block_end(ethernets_line, ethernets_indent)
+candidates = []
+i = ethernets_line + 1
+while i < ethernets_end:
+    stripped = lines[i].strip()
+    if not stripped or stripped.startswith("#"):
+        i += 1
+        continue
+    indent = indent_of(lines[i])
+    m = re.match(r"^\s*([^#\s][^:]*):\s*$", lines[i])
+    if m and indent > ethernets_indent:
+        key = m.group(1).strip().strip("'\"")
+        end = block_end(i, indent)
+        block = "\n".join(lines[i + 1:end])
+        candidates.append((key, i, indent, end, block))
+        i = end
+        continue
+    i += 1
+
+if not candidates:
+    raise SystemExit(f"No ethernet interface stanza was found in {path}")
+
+def block_has_set_name(block, name):
+    pat = r"(?m)^\s*set-name:\s*['\"]?" + re.escape(name) + r"['\"]?\s*$"
+    return re.search(pat, block) is not None
+
+def block_has_mac(block, mac):
+    if not mac:
+        return False
+    for m in re.finditer(r"(?im)^\s*macaddress:\s*['\"]?([0-9a-f:.-]+)['\"]?\s*$", block):
+        if m.group(1).lower() == mac:
+            return True
+    return False
+
+chosen = None
+for candidate in candidates:
+    if candidate[0] == iface:
+        chosen = candidate
+        break
+if chosen is None:
+    for candidate in candidates:
+        if block_has_set_name(candidate[4], iface):
+            chosen = candidate
+            break
+if chosen is None:
+    for candidate in candidates:
+        if block_has_mac(candidate[4], runtime_mac):
+            chosen = candidate
+            break
+if chosen is None and len(candidates) == 1:
+    chosen = candidates[0]
+
+if chosen is None:
+    found = ", ".join(c[0] for c in candidates)
+    raise SystemExit(
+        f"Could not match runtime interface {iface!r} in {path}. "
+        f"Found netplan stanzas: {found}. Set NETPLAN_FILE/IFACE manually if needed."
+    )
+
+_, iface_line, iface_indent, end, _ = chosen
+
 for i in range(iface_line + 1, len(lines)):
     stripped = lines[i].strip()
     if not stripped or stripped.startswith("#"):
         continue
-    indent = len(lines[i]) - len(lines[i].lstrip(" "))
+    indent = indent_of(lines[i])
     if indent <= iface_indent:
         end = i
         break
@@ -129,7 +207,7 @@ child_indent = None
 for i in range(iface_line + 1, end):
     stripped = lines[i].strip()
     if stripped and not stripped.startswith("#"):
-        indent = len(lines[i]) - len(lines[i].lstrip(" "))
+        indent = indent_of(lines[i])
         if indent > iface_indent:
             child_indent = indent
             break
